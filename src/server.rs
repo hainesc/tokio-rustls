@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use rustls::ServerConnection;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::common::{IoSession, Stream, TlsState};
+use crate::common::{IoSession, Stream, TlsReadState};
 
 /// A wrapper around an underlying raw stream which implements the TLS or SSL
 /// protocol.
@@ -17,7 +17,7 @@ use crate::common::{IoSession, Stream, TlsState};
 pub struct TlsStream<IO> {
     pub(crate) io: IO,
     pub(crate) session: ServerConnection,
-    pub(crate) state: TlsState,
+    pub(crate) state: TlsReadState,
 }
 
 impl<IO> TlsStream<IO> {
@@ -47,7 +47,7 @@ impl<IO> IoSession for TlsStream<IO> {
     }
 
     #[inline]
-    fn get_mut(&mut self) -> (&mut TlsState, &mut Self::Io, &mut Self::Session) {
+    fn get_mut(&mut self) -> (&mut TlsReadState, &mut Self::Io, &mut Self::Session) {
         (&mut self.state, &mut self.io, &mut self.session)
     }
 
@@ -71,7 +71,7 @@ where
             Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
 
         match &this.state {
-            TlsState::Stream | TlsState::WriteShutdown => {
+            TlsReadState::Stream | TlsReadState::WriteShutdown => {
                 let prev = buf.remaining();
 
                 match stream.as_mut_pin().poll_read(cx, buf) {
@@ -89,7 +89,8 @@ where
                     output => output,
                 }
             }
-            TlsState::ReadShutdown | TlsState::FullyShutdown => Poll::Ready(Ok(())),
+            TlsReadState::Direct | TlsReadState::Sniffing | TlsReadState::Partial(_, _) => todo!(),
+            TlsReadState::ReadShutdown | TlsReadState::FullyShutdown => Poll::Ready(Ok(())),
             #[cfg(feature = "early-data")]
             s => unreachable!("server TLS can not hit this state: {:?}", s),
         }

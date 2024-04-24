@@ -62,7 +62,7 @@ macro_rules! ready {
 
 pub mod client;
 mod common;
-use common::{MidHandshake, TlsState};
+use common::{MidHandshake, TlsReadState, TlsWriteState};
 pub mod server;
 
 /// A wrapper around a `rustls::ClientConfig`, providing an async `connect` method.
@@ -107,17 +107,23 @@ impl TlsConnector {
     }
 
     #[inline]
-    pub fn connect<IO>(&self, domain: pki_types::ServerName<'static>, stream: IO) -> Connect<IO>
+    pub fn connect<IO>(
+        &self,
+        domain: pki_types::ServerName<'static>,
+        stream: IO,
+        toad_likely: bool,
+    ) -> Connect<IO>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        self.connect_with(domain, stream, |_| ())
+        self.connect_with(domain, stream, toad_likely, |_| ())
     }
 
     pub fn connect_with<IO, F>(
         &self,
         domain: pki_types::ServerName<'static>,
         stream: IO,
+        toad_likely: bool,
         f: F,
     ) -> Connect<IO>
     where
@@ -141,13 +147,31 @@ impl TlsConnector {
             io: stream,
 
             #[cfg(not(feature = "early-data"))]
-            state: TlsState::Stream,
+            read_state: if toad_likely {
+                TlsReadState::Sniffing
+            } else {
+                TlsReadState::Stream
+            },
 
             #[cfg(feature = "early-data")]
-            state: if self.early_data && session.early_data().is_some() {
-                TlsState::EarlyData(0, Vec::new())
+            read_state: if self.early_data && session.early_data().is_some() {
+                TlsReadState::EarlyData(0, Vec::new())
             } else {
-                TlsState::Stream
+                TlsReadState::Stream
+            },
+
+            #[cfg(not(feature = "early-data"))]
+            write_state: if toad_likely {
+                TlsWriteState::Sniffing
+            } else {
+                TlsWriteState::Stream
+            },
+
+            #[cfg(feature = "early-data")]
+            write_state: if self.early_data && session.early_data().is_some() {
+                TlsWriteState::EarlyData(0, Vec::new())
+            } else {
+                TlsWriteState::Stream
             },
 
             #[cfg(feature = "early-data")]
@@ -188,7 +212,7 @@ impl TlsAcceptor {
         Accept(MidHandshake::Handshaking(server::TlsStream {
             session,
             io: stream,
-            state: TlsState::Stream,
+            state: TlsReadState::Stream,
         }))
     }
 }
@@ -353,7 +377,7 @@ where
         Accept(MidHandshake::Handshaking(server::TlsStream {
             session: conn,
             io: self.io,
-            state: TlsState::Stream,
+            state: TlsReadState::Stream,
         }))
     }
 }

@@ -10,46 +10,102 @@ mod handshake;
 pub(crate) use handshake::{IoSession, MidHandshake};
 
 #[derive(Debug)]
-pub enum TlsState {
+pub enum TlsReadState {
     #[cfg(feature = "early-data")]
     EarlyData(usize, Vec<u8>),
+    Sniffing,
     Stream,
+    Direct,
+    Partial(usize, bool),
     ReadShutdown,
     WriteShutdown,
     FullyShutdown,
 }
 
-impl TlsState {
+impl TlsReadState {
     #[inline]
     pub fn shutdown_read(&mut self) {
         match *self {
-            TlsState::WriteShutdown | TlsState::FullyShutdown => *self = TlsState::FullyShutdown,
-            _ => *self = TlsState::ReadShutdown,
+            TlsReadState::WriteShutdown | TlsReadState::FullyShutdown => {
+                *self = TlsReadState::FullyShutdown
+            }
+            _ => *self = TlsReadState::ReadShutdown,
+        }
+    }
+
+    #[inline]
+    pub fn direct_read(&mut self) {
+        match *self {
+            TlsReadState::WriteShutdown
+            | TlsReadState::ReadShutdown
+            | TlsReadState::FullyShutdown => *self = TlsReadState::FullyShutdown,
+            _ => *self = TlsReadState::Direct,
+        }
+    }
+
+    #[inline]
+    pub fn partial_read(&mut self, remains: usize, keep: bool) {
+        match *self {
+            TlsReadState::WriteShutdown
+            | TlsReadState::ReadShutdown
+            | TlsReadState::FullyShutdown => *self = TlsReadState::FullyShutdown,
+            TlsReadState::Sniffing | TlsReadState::Partial(_, _) => {
+                *self = TlsReadState::Partial(remains, keep)
+            }
+            _ => *self = TlsReadState::Stream,
+        }
+    }
+
+    #[inline]
+    pub fn stream_read(&mut self) {
+        match *self {
+            TlsReadState::WriteShutdown
+            | TlsReadState::ReadShutdown
+            | TlsReadState::FullyShutdown => *self = TlsReadState::FullyShutdown,
+            _ => *self = TlsReadState::Stream,
+        }
+    }
+
+    #[inline]
+    pub fn goto_next(&mut self, next: TlsReadState) {
+        match *self {
+            TlsReadState::WriteShutdown
+            | TlsReadState::ReadShutdown
+            | TlsReadState::FullyShutdown => *self = TlsReadState::FullyShutdown,
+            _ => *self = next,
         }
     }
 
     #[inline]
     pub fn shutdown_write(&mut self) {
         match *self {
-            TlsState::ReadShutdown | TlsState::FullyShutdown => *self = TlsState::FullyShutdown,
-            _ => *self = TlsState::WriteShutdown,
+            TlsReadState::ReadShutdown | TlsReadState::FullyShutdown => {
+                *self = TlsReadState::FullyShutdown
+            }
+            _ => *self = TlsReadState::WriteShutdown,
         }
     }
 
     #[inline]
     pub fn writeable(&self) -> bool {
-        !matches!(*self, TlsState::WriteShutdown | TlsState::FullyShutdown)
+        !matches!(
+            *self,
+            TlsReadState::WriteShutdown | TlsReadState::FullyShutdown
+        )
     }
 
     #[inline]
     pub fn readable(&self) -> bool {
-        !matches!(*self, TlsState::ReadShutdown | TlsState::FullyShutdown)
+        !matches!(
+            *self,
+            TlsReadState::ReadShutdown | TlsReadState::FullyShutdown
+        )
     }
 
     #[inline]
     #[cfg(feature = "early-data")]
     pub fn is_early_data(&self) -> bool {
-        matches!(self, TlsState::EarlyData(..))
+        matches!(self, TlsReadState::EarlyData(..))
     }
 
     #[inline]
@@ -57,6 +113,94 @@ impl TlsState {
     pub const fn is_early_data(&self) -> bool {
         false
     }
+}
+
+#[derive(Debug)]
+pub enum TlsWriteState {
+    #[cfg(feature = "early-data")]
+    EarlyData(usize, Vec<u8>),
+    Sniffing,
+    Stream,
+    Direct,
+    Partial(usize, u8),
+    ReadShutdown,
+    WriteShutdown,
+    FullyShutdown,
+}
+
+impl TlsWriteState {
+    #[inline]
+    pub fn direct_write(&mut self) {
+        match *self {
+            TlsWriteState::WriteShutdown | TlsWriteState::FullyShutdown => {
+                *self = TlsWriteState::FullyShutdown
+            }
+            _ => *self = TlsWriteState::Direct,
+        }
+    }
+
+    #[inline]
+    pub fn partial_write(&mut self, remains: usize, typ: u8) {
+        match *self {
+            TlsWriteState::WriteShutdown | TlsWriteState::FullyShutdown => {
+                *self = TlsWriteState::FullyShutdown
+            }
+            TlsWriteState::Sniffing | TlsWriteState::Partial(_, _) => {
+                *self = TlsWriteState::Partial(remains, typ)
+            }
+            _ => *self = TlsWriteState::Stream,
+        }
+    }
+
+    #[inline]
+    pub fn stream_write(&mut self) {
+        match *self {
+            TlsWriteState::WriteShutdown | TlsWriteState::FullyShutdown => {
+                *self = TlsWriteState::FullyShutdown
+            }
+            _ => *self = TlsWriteState::Stream,
+        }
+    }
+
+    #[inline]
+    pub fn goto_next(&mut self, next: TlsWriteState) {
+        match *self {
+            TlsWriteState::WriteShutdown | TlsWriteState::FullyShutdown => {
+                *self = TlsWriteState::FullyShutdown
+            }
+            _ => *self = next,
+        }
+    }
+
+    #[inline]
+    pub fn shutdown_write(&mut self) {
+        match *self {
+            TlsWriteState::WriteShutdown | TlsWriteState::FullyShutdown => {
+                *self = TlsWriteState::FullyShutdown
+            }
+            _ => *self = TlsWriteState::WriteShutdown,
+        }
+    }
+
+    #[inline]
+    pub fn writeable(&self) -> bool {
+        !matches!(
+            *self,
+            TlsWriteState::WriteShutdown | TlsWriteState::FullyShutdown
+        )
+    }
+
+    #[inline]
+    #[cfg(feature = "early-data")]
+    pub fn is_early_data(&self) -> bool {
+        matches!(self, TlsWriteState::EarlyData(..))
+    }
+}
+
+#[inline]
+#[cfg(feature = "early-data")]
+pub fn is_early_data(&self) -> bool {
+    matches!(self, TlsWriteState::EarlyData(..))
 }
 
 pub struct Stream<'a, IO, C> {

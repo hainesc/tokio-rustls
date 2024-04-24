@@ -8,14 +8,14 @@ use rustls::server::AcceptedAlert;
 use rustls::{ConnectionCommon, SideData};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::common::{Stream, SyncWriteAdapter, TlsState};
+use crate::common::{Stream, SyncWriteAdapter, TlsReadState};
 
 pub(crate) trait IoSession {
     type Io;
     type Session;
 
     fn skip_handshake(&self) -> bool;
-    fn get_mut(&mut self) -> (&mut TlsState, &mut Self::Io, &mut Self::Session);
+    fn get_mut(&mut self) -> (&mut TlsReadState, &mut Self::Io, &mut Self::Session);
     fn into_io(self) -> Self::Io;
 }
 

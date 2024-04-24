@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use rustls::ClientConnection;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::common::{IoSession, Stream, TlsState};
+use crate::common::{IoSession, Stream, TlsReadState, TlsWriteState};
 
 /// A wrapper around an underlying raw stream which implements the TLS or SSL
 /// protocol.
@@ -19,7 +19,8 @@ use crate::common::{IoSession, Stream, TlsState};
 pub struct TlsStream<IO> {
     pub(crate) io: IO,
     pub(crate) session: ClientConnection,
-    pub(crate) state: TlsState,
+    pub(crate) read_state: TlsReadState,
+    pub(crate) write_state: TlsWriteState,
 
     #[cfg(feature = "early-data")]
     pub(crate) early_waker: Option<Waker>,
@@ -68,12 +69,12 @@ impl<IO> IoSession for TlsStream<IO> {
 
     #[inline]
     fn skip_handshake(&self) -> bool {
-        self.state.is_early_data()
+        self.read_state.is_early_data()
     }
 
     #[inline]
-    fn get_mut(&mut self) -> (&mut TlsState, &mut Self::Io, &mut Self::Session) {
-        (&mut self.state, &mut self.io, &mut self.session)
+    fn get_mut(&mut self) -> (&mut TlsReadState, &mut Self::Io, &mut Self::Session) {
+        (&mut self.read_state, &mut self.io, &mut self.session)
     }
 
     #[inline]
@@ -91,9 +92,9 @@ where
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.state {
+        match self.read_state {
             #[cfg(feature = "early-data")]
-            TlsState::EarlyData(..) => {
+            TlsReadState::EarlyData(..) => {
                 let this = self.get_mut();
 
                 // In the EarlyData state, we have not really established a Tls connection.
@@ -113,28 +114,129 @@ where
 
                 Poll::Pending
             }
-            TlsState::Stream | TlsState::WriteShutdown => {
+            TlsReadState::Stream | TlsReadState::WriteShutdown => {
                 let this = self.get_mut();
-                let mut stream =
-                    Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
                 let prev = buf.remaining();
 
                 match stream.as_mut_pin().poll_read(cx, buf) {
                     Poll::Ready(Ok(())) => {
                         if prev == buf.remaining() || stream.eof {
-                            this.state.shutdown_read();
+                            this.read_state.shutdown_read();
                         }
 
                         Poll::Ready(Ok(()))
                     }
                     Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {
-                        this.state.shutdown_read();
+                        this.read_state.shutdown_read();
                         Poll::Ready(Err(err))
                     }
                     output => output,
                 }
             }
-            TlsState::ReadShutdown | TlsState::FullyShutdown => Poll::Ready(Ok(())),
+            TlsReadState::Sniffing => {
+                let this = self.get_mut();
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
+                let prev = buf.remaining();
+                match stream.as_mut_pin().poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) => {
+                        let mut hdr = [0u8; 5];
+                        hdr.copy_from_slice(&(buf.filled()[..5]));
+                        if prev == buf.remaining() || stream.eof {
+                            this.read_state.shutdown_read();
+                        }
+
+                        match hdr[0] {
+                            // change cipher spec
+                            0x14 => {
+                                let len = u16::from_be_bytes(hdr[3..5].try_into().unwrap());
+                                if prev - buf.remaining() < 5 + usize::from(len) {
+                                    this.read_state.partial_read(
+                                        5 + usize::from(len) + buf.remaining() - prev,
+                                        false,
+                                    );
+                                } else {
+                                    this.read_state.direct_read();
+                                }
+                            }
+                            // alert, handshake and application data.
+                            0x15 | 0x16 | 0x17 => {
+                                let len = u16::from_be_bytes(hdr[3..5].try_into().unwrap());
+                                if prev - buf.remaining() < 5 + usize::from(len) {
+                                    // keep sniffing.
+                                    this.read_state.partial_read(
+                                        5 + usize::from(len) + buf.remaining() - prev,
+                                        true,
+                                    );
+                                } // else do not change state.
+                            }
+                            // invalid type of tls record.
+                            _ => {
+                                // goto stream read.
+                                this.read_state.stream_read();
+                            }
+                        };
+                        Poll::Ready(Ok(()))
+                    }
+
+                    Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {
+                        this.read_state.shutdown_read();
+                        Poll::Ready(Err(err))
+                    }
+                    output => output,
+                }
+            }
+            TlsReadState::Partial(remains, keep) => {
+                let this = self.get_mut();
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
+                let prev = buf.remaining();
+                match stream.as_mut_pin().poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) => {
+                        if prev == buf.remaining() || stream.eof {
+                            this.read_state.shutdown_read();
+                        }
+
+                        if prev - buf.remaining() < remains {
+                            this.read_state
+                                .partial_read(buf.remaining() + remains - prev, keep);
+                        } else {
+                            if keep {
+                                this.read_state.goto_next(TlsReadState::Sniffing);
+                            } else {
+                                this.read_state.goto_next(TlsReadState::Direct);
+                            }
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {
+                        this.read_state.shutdown_read();
+                        Poll::Ready(Err(err))
+                    }
+                    output => output,
+                }
+            }
+            TlsReadState::Direct => {
+                let this = self.get_mut();
+                let stream = &mut this.io;
+                let prev = buf.remaining();
+                match Pin::new(stream).poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) => {
+                        if prev == buf.remaining() {
+                            this.read_state.shutdown_read();
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::ConnectionAborted => {
+                        this.read_state.shutdown_read();
+                        Poll::Ready(Err(err))
+                    }
+                    output => output,
+                }
+            }
+            TlsReadState::ReadShutdown | TlsReadState::FullyShutdown => Poll::Ready(Ok(())),
         }
     }
 }
@@ -151,25 +253,103 @@ where
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        let mut stream =
-            Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+        match this.write_state {
+            #[cfg(feature = "early-data")]
+            TlsWriteState::EarlyData(ref mut pos, ref mut data) => {
+                let mut stream =
+                    Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+                #[cfg(feature = "early-data")]
+                {
+                    let bufs = [io::IoSlice::new(buf)];
+                    let written = ready!(poll_handle_early_data(
+                        &mut this.state,
+                        &mut stream,
+                        &mut this.early_waker,
+                        cx,
+                        &bufs
+                    ))?;
+                    if written != 0 {
+                        return Poll::Ready(Ok(written));
+                    }
+                }
+                stream.as_mut_pin().poll_write(cx, buf)
+            }
 
-        #[cfg(feature = "early-data")]
-        {
-            let bufs = [io::IoSlice::new(buf)];
-            let written = ready!(poll_handle_early_data(
-                &mut this.state,
-                &mut stream,
-                &mut this.early_waker,
-                cx,
-                &bufs
-            ))?;
-            if written != 0 {
-                return Poll::Ready(Ok(written));
+            TlsWriteState::Sniffing => {
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
+                let mut hdr = [0u8; 5];
+                // TODO: what about if too short
+                hdr.copy_from_slice(&buf[..5]);
+                let len = u16::from_be_bytes(hdr[3..5].try_into().unwrap());
+                let max = if 5 + usize::from(len) < buf.len() {
+                    5 + usize::from(len)
+                } else {
+                    buf.len()
+                };
+                match hdr[0] {
+                    // change cipher spec, alert, handshake and application data, proxy request.
+                    0x14 | 0x15 | 0x16 | 0x17 | 0x59 => {
+                        match stream.as_mut_pin().poll_write(cx, &buf[..max]) {
+                            Poll::Ready(Ok(n)) => {
+                                if n < 5 + usize::from(len) {
+                                    this.write_state
+                                        .partial_write(5 + usize::from(len) - n, hdr[0])
+                                } else {
+                                    if hdr[0] == 0x14 {
+                                        this.write_state.direct_write();
+                                        let _ = stream.as_mut_pin().poll_flush(cx);
+                                    }
+                                }
+                                Poll::Ready(Ok(n))
+                            }
+                            output => output,
+                        }
+                    }
+                    // invalid type of tls record.
+                    _ => {
+                        this.write_state.stream_write();
+                        stream.as_mut_pin().poll_write(cx, buf)
+                    }
+                }
+            }
+
+            TlsWriteState::Partial(remains, typ) => {
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
+                let max = if remains < buf.len() {
+                    remains
+                } else {
+                    buf.len()
+                };
+                match stream.as_mut_pin().poll_write(cx, &buf[..max]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n < remains {
+                            this.write_state.partial_write(remains - n, typ)
+                        } else {
+                            if typ == 0x14 {
+                                this.write_state.goto_next(TlsWriteState::Direct);
+                                let _ = stream.as_mut_pin().poll_flush(cx);
+                            } else {
+                                this.write_state.goto_next(TlsWriteState::Sniffing);
+                            }
+                        }
+                        Poll::Ready(Ok(n))
+                    }
+                    output => output,
+                }
+            }
+            TlsWriteState::Direct => {
+                let stream = &mut this.io;
+                Pin::new(stream).poll_write(cx, buf)
+            }
+
+            _ => {
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
+                stream.as_mut_pin().poll_write(cx, buf)
             }
         }
-
-        stream.as_mut_pin().poll_write(cx, buf)
     }
 
     /// Note: that it does not guarantee the final data to be sent.
@@ -181,7 +361,7 @@ where
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         let mut stream =
-            Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+            Stream::new(&mut this.io, &mut this.session).set_eof(!this.read_state.readable());
 
         #[cfg(feature = "early-data")]
         {
@@ -207,38 +387,52 @@ where
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let mut stream =
-            Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+        match this.write_state {
+            #[cfg(feature = "early-data")]
+            TlsReadState::EarlyData(ref mut pos, ref mut data) => {
+                let mut stream =
+                    Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+                #[cfg(feature = "early-data")]
+                ready!(poll_handle_early_data(
+                    &mut this.state,
+                    &mut stream,
+                    &mut this.early_waker,
+                    cx,
+                    &[]
+                ))?;
+                stream.as_mut_pin().poll_flush(cx)
+            }
 
-        #[cfg(feature = "early-data")]
-        ready!(poll_handle_early_data(
-            &mut this.state,
-            &mut stream,
-            &mut this.early_waker,
-            cx,
-            &[]
-        ))?;
+            TlsWriteState::Direct => {
+                let stream = &mut this.io;
+                Pin::new(stream).poll_flush(cx)
+            }
 
-        stream.as_mut_pin().poll_flush(cx)
+            _ => {
+                let mut stream = Stream::new(&mut this.io, &mut this.session)
+                    .set_eof(!this.read_state.readable());
+                stream.as_mut_pin().poll_flush(cx)
+            }
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         #[cfg(feature = "early-data")]
         {
             // complete handshake
-            if matches!(self.state, TlsState::EarlyData(..)) {
+            if matches!(self.state, TlsReadState::EarlyData(..)) {
                 ready!(self.as_mut().poll_flush(cx))?;
             }
         }
 
-        if self.state.writeable() {
+        if self.read_state.writeable() {
             self.session.send_close_notify();
-            self.state.shutdown_write();
+            self.read_state.shutdown_write();
         }
 
         let this = self.get_mut();
         let mut stream =
-            Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
+            Stream::new(&mut this.io, &mut this.session).set_eof(!this.read_state.readable());
         stream.as_mut_pin().poll_shutdown(cx)
     }
 }
