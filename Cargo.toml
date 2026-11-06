@@ -13,7 +13,7 @@ rust-version = "1.71"
 exclude = ["/.github", "/examples", "/scripts", "/tests/"]
 
 [dependencies]
-rustls = { version = "0.24.0-dev.2", default-features = false, features = ["webpki"] }
+rustls = { path = "../rustls_new/rustls", default-features = false, features = ["webpki", "std"] }
 tokio = "1.0"
 
 [features]
@@ -27,7 +27,7 @@ zlib = ["rustls/zlib"]
 argh = "0.1.1"
 futures-util = "0.3.1"
 rcgen = { version = "0.14", features = ["pem"] }
-rustls-aws-lc-rs = { version = "0.24.0-dev.2" }
+rustls-aws-lc-rs = { path = "../rustls_new/rustls-aws-lc-rs" }
 tokio = { version = "1.0", features = ["full"] }
 webpki-roots = "1"
 

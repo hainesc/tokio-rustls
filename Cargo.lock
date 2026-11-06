@@ -545,11 +545,10 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.24.0-dev.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e7d0e095ff3f79172e5985922dbde4cb5bd98eb72518551589688502eab011de"
 dependencies = [
  "brotli",
  "brotli-decompressor",
+ "rustls-fingerprint",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -561,14 +560,19 @@ dependencies = [
 [[package]]
 name = "rustls-aws-lc-rs"
 version = "0.24.0-dev.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbaf2c8aa7c430a99e84875dd184bb924de386dd8b32d3fa85dab4b5190432d4"
 dependencies = [
  "aws-lc-rs",
  "rustls",
  "rustls-pki-types",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-fingerprint"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
 ]
 
 [[package]]
@@ -582,9 +586,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.104.0-alpha.7"
+version = "0.104.0-alpha.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bea702cca24d344fc70973022bf7eb920c224e318466eb49784272337dd24b1a"
+checksum = "e4f05eb03bb89c8b88908947d1add6fbe564e58db7b686dbda59691aaec0e450"
 dependencies = [
  "rustls-pki-types",
  "untrusted",
