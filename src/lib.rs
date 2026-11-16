@@ -225,6 +225,7 @@ struct Buffered<Side: SideData> {
     received_plaintext: Vec<u8>,
     received_close_notify: bool,
     has_seen_eof: bool,
+    single_record_mode: bool,
 }
 
 impl<Side: SideData> Buffered<Side> {
@@ -237,7 +238,17 @@ impl<Side: SideData> Buffered<Side> {
             received_plaintext: Vec::with_capacity(1_024),
             received_close_notify: false,
             has_seen_eof: false,
+            single_record_mode: false,
         }
+    }
+
+    /// Returns true if `input` already holds at least one complete TLS record.
+    fn has_complete_record(&self) -> bool {
+        if self.used < 5 {
+            return false;
+        }
+        let rec_len = 5 + u16::from_be_bytes([self.input[3], self.input[4]]) as usize;
+        self.used >= rec_len
     }
 
     /// Whether more TLS data should be read from the transport
@@ -266,7 +277,14 @@ impl<Side: SideData> Buffered<Side> {
 
     /// Processes the filled part of the input buffer, appending plaintext to `received_plaintext`
     fn process_input(&mut self) -> Result<(), rustls::Error> {
-        let mut input = SliceInput::new(&mut self.input[..self.used]);
+        let limit = if self.single_record_mode && self.used >= 5 {
+            let rec_len = 5 + u16::from_be_bytes([self.input[3], self.input[4]]) as usize;
+            Ord::min(self.used, rec_len)
+        } else {
+            self.used
+        };
+
+        let mut input = SliceInput::new(&mut self.input[..limit]);
         let result = self
             .conn
             .read_tls(&mut input, &mut self.tls)

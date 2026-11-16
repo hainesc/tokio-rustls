@@ -87,6 +87,15 @@ impl<'a, IO: AsyncRead + AsyncWrite + Unpin, SD: SideData> Stream<'a, IO, SD> {
     }
 
     pub(crate) fn read_io(&mut self, cx: &mut Context) -> Poll<io::Result<usize>> {
+        if self.buffered.single_record_mode && self.buffered.has_complete_record() {
+            let error = match self.buffered.process_input() {
+                Ok(_) => return Poll::Ready(Ok(0)),
+                Err(err) => err,
+            };
+            let _ = self.write_io(cx);
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, error)));
+        }
+
         let mut buf = match self.buffered.read_buf() {
             Ok(buf) => buf,
             Err(err) => return Poll::Ready(Err(err)),

@@ -267,6 +267,20 @@ impl<IO> TlsStream<IO> {
         (&mut self.io, &mut self.buffered.conn)
     }
 
+    #[inline]
+    pub fn set_single_record_mode(&mut self, enabled: bool) {
+        self.buffered.single_record_mode = enabled;
+    }
+
+    #[inline]
+    pub fn take_buffered_for_direct_read(&mut self) -> (Vec<u8>, Vec<u8>) {
+        let mut input = std::mem::take(&mut self.buffered.input);
+        input.truncate(self.buffered.used);
+        self.buffered.used = 0;
+        let plaintext = std::mem::take(&mut self.buffered.received_plaintext);
+        (plaintext, input)
+    }
+
     /// Consumes the `TlsStream`, returning its underlying parts.
     #[inline]
     pub fn into_inner(self) -> TlsStreamParts<IO, ClientSide> {
@@ -315,6 +329,7 @@ impl<IO> TlsStream<IO> {
             received_plaintext,
             received_close_notify: false,
             has_seen_eof: false,
+            single_record_mode: false,
         };
 
         Self {
@@ -424,7 +439,7 @@ where
         buf.put_slice(&data[..len]);
         self.as_mut().consume(len);
 
-        while buf.remaining() > 0 {
+        while !self.buffered.single_record_mode && buf.remaining() > 0 {
             let data = match self.as_mut().poll_fill_buf(cx) {
                 Poll::Ready(Ok([])) => break,
                 Poll::Ready(Ok(data)) => data,
